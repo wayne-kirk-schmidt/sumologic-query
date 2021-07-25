@@ -2,36 +2,39 @@
 # -*- coding: utf-8 -*-
 
 """
-Exaplanation: sumo_query is a Sumo Logic cmdlet that manages a query
+Exaplanation: sumoquery is a Sumo Logic cmdlet that manages a query
 
 Usage:
-   $ python  sumo_query [ options ]
+   $ python  sumoquery [ options ]
 
 Style:
    Google Python Style Guide:
    http://google.github.io/styleguide/pyguide.html
 
-    @name           sumocli_sumo_query
-    @version        0.90
+    @name           sumoquery
+    @version        1.00
     @author-name    Wayne Schmidt
     @author-email   wschmidt@sumologic.com
     @license-name   GNU GPL
     @license-url    http://www.gnu.org/licenses/gpl.html
 """
 
-__version__ = 0.90
+__version__ = 1.00
 __author__ = "Wayne Schmidt (wschmidt@sumologic.com)"
 
 ### beginning ###
 import json
-import pprint
 import os
 import sys
 import argparse
 import http
 import re
 import time
+import random
+import multiprocessing
 import requests
+import pandas
+
 sys.dont_write_bytecode = 1
 
 MY_CFG = 'undefined'
@@ -44,12 +47,18 @@ PARSER.add_argument("-a", metavar='<secret>', dest='MY_APIKEY', \
 PARSER.add_argument("-e", metavar='<endpoint>', dest='MY_ENDPOINT', \
                     help="set query endpoint (format: <dep>) ")
 PARSER.add_argument("-t", metavar='<targetorg>', dest='MY_TARGET', \
-                    help="set query target  (format: <dep>_<orgid>) ")
+                    action='append', help="set query target  (format: <dep>_<orgid>) ")
 PARSER.add_argument("-q", metavar='<query>', dest='MY_QUERY', help="set query content")
 PARSER.add_argument("-r", metavar='<range>', dest='MY_RANGE', default='1h', \
                     help="set query range")
 PARSER.add_argument("-o", metavar='<fmt>', default="csv", dest='OUT_FORMAT', \
                     help="set query output (values: txt, csv)")
+PARSER.add_argument("-d", metavar='<outdir>', default="/var/tmp", dest='OUTPUTDIR', \
+                    help="set query output directory")
+PARSER.add_argument("-s", metavar='<sleeptime>', default=1, dest='SLEEPTIME', \
+                    help="set sleep time to check results")
+PARSER.add_argument("-w", metavar='<workers>', type=int, default=1, dest='WORKERS', \
+                    help="set number of workers to process")
 PARSER.add_argument("-v", type=int, default=0, metavar='<verbose>', \
                     dest='VERBOSE', help="increase verbosity")
 
@@ -75,6 +84,8 @@ CSV_SEP = ','
 TAB_SEP = '\t'
 EOL_SEP = '\n'
 
+MY_SLEEP = int(ARGS.SLEEPTIME)
+
 MY_SEP = CSV_SEP
 if ARGS.OUT_FORMAT == 'txt':
     MS_SEP = TAB_SEP
@@ -90,6 +101,8 @@ TIME_TABLE["w"] = TIME_TABLE["d"] * WEEK_D
 
 TIME_PARAMS = dict()
 
+TARGETS = ARGS.MY_TARGET
+
 if ARGS.MY_APIKEY:
     (MY_APINAME, MY_APISECRET) = ARGS.MY_APIKEY.split(':')
     os.environ['SUMO_UID'] = MY_APINAME
@@ -98,23 +111,13 @@ if ARGS.MY_APIKEY:
 if ARGS.MY_ENDPOINT:
     os.environ['SUMO_END'] = ARGS.MY_ENDPOINT
 
-if ARGS.MY_TARGET:
-    (MY_DEPLOYMENT, MY_ORGID) = ARGS.MY_TARGET.split('_')
-    os.environ['SUMO_LOC'] = MY_DEPLOYMENT
-    os.environ['SUMO_ORG'] = MY_ORGID
-
 try:
-
     SUMO_UID = os.environ['SUMO_UID']
     SUMO_KEY = os.environ['SUMO_KEY']
     SUMO_END = os.environ['SUMO_END']
-    SUMO_LOC = os.environ['SUMO_LOC']
-    SUMO_ORG = os.environ['SUMO_ORG']
 
 except KeyError as myerror:
     print('Environment Variable Not Set :: {} '.format(myerror.args[0]))
-
-PPRINT = pprint.PrettyPrinter(indent=4)
 
 ### beginning ###
 
@@ -124,61 +127,109 @@ def main():
     Once done, then issue the command required
     """
 
-    source = SumoApiClient(SUMO_UID, SUMO_KEY, SUMO_END)
-
+    apisession = SumoApiClient(SUMO_UID, SUMO_KEY, SUMO_END)
+    query_targets = resolve_targets(TARGETS)
+    query_list = collect_queries()
     time_params = calculate_range()
 
-    counter = 1
+    if ARGS.WORKERS == 1:
+        process_request(apisession, query_targets, query_list, time_params)
+    else:
+        worker_manager(query_targets)
 
+def worker_task(inputs):
+    """
+    This is the worker task function
+    """
+    apisession = SumoApiClient(SUMO_UID, SUMO_KEY, SUMO_END)
     query_list = collect_queries()
-    for query_item in query_list:
-        query_data = collect_contents(query_item)
-        query_data = tailor_queries(query_data)
-        if ARGS.VERBOSE > 4:
-            print('RUN_QUERY.query_item: {}'.format(query_item))
-            print('RUN_QUERY.query_data: {}'.format(query_data))
-        header_output = run_sumo_query(source, query_data, time_params)
-        if ARGS.VERBOSE > 8:
-            print('RUN_QUERY.output: {}'.format(header_output))
-        write_query_output(header_output, counter)
-        counter += 1
+    time_params = calculate_range()
+    workerpid = multiprocessing.current_process()
+    if ARGS.VERBOSE > 5:
+        print('SUMOQUERY.worker: {}'.format(workerpid))
+        print('SUMOQUERY.worktarget: {}'.format(inputs))
 
-def write_query_output(header_output, query_number):
+    query_targets = list()
+    query_targets.append(inputs)
+
+    process_request(apisession, query_targets, query_list, time_params)
+
+def worker_manager(query_targets):
+    """
+    This is the manager function to handle mapping tasks to workers
+    """
+    worker_list = query_targets
+    with multiprocessing.Pool(ARGS.WORKERS) as task_queue:
+        task_queue.map(worker_task, worker_list)
+
+def process_request(apisession, query_targets, query_list, time_params):
+    """
+    perform the queries and process the output
+    """
+    for query_target in query_targets:
+        querycounter = 1
+        for query_item in query_list:
+            query_data = collect_contents(query_item)
+            query_data = tailor_queries(query_data, query_target)
+            if ARGS.VERBOSE > 7:
+                print('SUMOQUERY.query_item: {}'.format(query_item))
+                print('SUMOQUERY.query_data: {}'.format(query_data))
+            header_output = run_sumo_query(apisession, query_data, time_params)
+            write_query_output(header_output, query_target, querycounter)
+            querycounter += 1
+
+def resolve_targets(target_org_list):
+    """
+    Resolve targets based on input
+    """
+    query_targets = list()
+
+    for target_org in target_org_list:
+        if os.path.isfile(target_org):
+            with open(target_org) as input_file:
+                input_lines = [input_line.rstrip() for input_line in input_file]
+                query_targets += input_lines
+        else:
+            query_targets.append(target_org)
+
+    return query_targets
+
+def write_query_output(header_output, query_target, query_number):
     """
     This is a wrapper for writing out the contents of a file
     """
 
     ext_sep = '.'
 
-    querytag = SUMO_END + '.' + SUMO_LOC + '_' + SUMO_ORG
+    querytag = SUMO_END + '.' + query_target
 
     extension = ARGS.OUT_FORMAT
     number = '{:03d}'.format(query_number)
 
-    output_dir = '/var/tmp'
+    output_dir = os.path.abspath(ARGS.OUTPUTDIR)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
     output_file = ext_sep.join((querytag, str(number), extension))
     output_target = os.path.join(output_dir, output_file)
 
-    if ARGS.VERBOSE > 2:
-        print(header_output)
-
     if ARGS.VERBOSE > 3:
-        print(output_target)
+        print('SUMOQUERY.outputfile: {}'.format(output_target))
 
-    file_object = open(output_target, "w")
-    file_object.write(header_output + '\n' )
-    file_object.close()
+    with open(output_target, "w") as file_object:
+        file_object.write(header_output + '\n' )
+        file_object.close()
 
-def tailor_queries(query_item):
+def tailor_queries(query_item, query_target):
     """
     This substitutes common parameters for values from the script.
     Later, this will be a data driven exercise.
     """
     replacements = dict()
-    replacements['{{deployment}}'] = os.environ['SUMO_LOC']
-    replacements['{{org_id}}'] = os.environ['SUMO_ORG']
+    replacements['{{deployment}}'] = query_target.split('_')[0]
+    replacements['{{org_id}}'] = query_target.split('_')[1]
     replacements['{{longquery_limit_stmt}}'] = str(LONGQUERY_LIMIT)
-    replacements['{{key}}'] = str(ARGS.MY_ENDPOINT)
+    replacements['{{key}}'] = query_target
     for sub_key, sub_value in replacements.items():
         query_item = query_item.replace(sub_key, sub_value)
     return query_item
@@ -232,59 +283,82 @@ def collect_contents(query_item):
     """
     query = query_item
     if os.path.exists(query_item):
-        file_object = open(query_item, "r")
-        query = file_object.read()
-        file_object.close()
+        with open(query_item, "r") as file_object:
+            query = file_object.read()
+            file_object.close()
     return query
 
-def run_sumo_query(source, query, time_params):
+def run_sumo_query(apisession, query, time_params):
     """
     This runs the Sumo Command, and then saves the output and the status
     """
-
-    query_job = source.search_job(query, time_params)
+    query_job = apisession.search_job(query, time_params)
     query_jobid = query_job["id"]
-    if ARGS.VERBOSE > 4:
-        print('RUN_QUERY.jobid: {}'.format(query_jobid))
+    if ARGS.VERBOSE > 3:
+        print('SUMOQUERY.jobid: {}'.format(query_jobid))
 
-    (query_status, num_records, iterations) = source.search_job_records_tally(query_jobid)
+    (query_status, num_messages, num_records, iterations) = apisession.search_job_tally(query_jobid)
     if ARGS.VERBOSE > 4:
-        print('RUN_QUERY.status: {}'.format(query_status))
-        print('RUN_QUERY.records: {}'.format(num_records))
-        print('RUN_QUERY.iterations: {}'.format(iterations))
+        print('SUMOQUERY.status: {}'.format(query_status))
+        print('SUMOQUERY.records: {}'.format(num_records))
+        print('SUMOQUERY.messages: {}'.format(num_messages))
+        print('SUMOQUERY.iterations: {}'.format(iterations))
+
+    assembled_output = build_assembled_output(apisession, query_jobid, num_records, iterations)
+
+    return assembled_output
+
+def build_assembled_output(apisession, query_jobid, num_records, iterations):
+    """
+    This assembles the header and output, going through the iterations of the output
+    """
+
+    if num_records == 0:
+        assembled_output = 'NORECORDS'
+    if num_records > 0:
+        total_records = ''
+        for my_counter in range(0, iterations, 1):
+            my_limit = LIMIT
+            my_offset = ( my_limit * my_counter )
+
+            query_records = apisession.search_job_records(query_jobid, my_limit, my_offset)
+
+            header,header_list = build_header(query_records)
+            output = build_body(query_records,header_list)
+            total_records = total_records + output
+
+        assembled_output = EOL_SEP.join([ header , total_records ])
+
+    return assembled_output
+
+def build_header(query_records):
+    """
+    This builds the header of the output from the results of query_records
+    """
 
     header_list = list()
-    record_body_list = list()
-
-    for my_counter in range(0, iterations, 1):
-        my_limit = LIMIT
-        my_offset = ( my_limit * my_counter )
-
-        query_records = source.search_job_records(query_jobid, my_limit, my_offset)
-        query_messages = source.search_job_messages(query_jobid, my_limit, my_offset)
-
-        if my_counter == 0:
-            fields = query_records["fields"]
-            for field in fields:
-                fieldname = field["name"]
-                header_list.append(fieldname)
-
-        records = query_records["records"]
-        for record in records:
-            record_line_list = list()
-            for field in fields:
-                fieldname = field["name"]
-                recordname = str(record["map"][fieldname])
-                record_line_list.append(recordname)
-                record_line = MY_SEP.join(record_line_list)
-            record_body_list.append(record_line)
-
+    dataframe = pandas.DataFrame.from_records(query_records['fields'])
+    myfielddf = pandas.DataFrame(dataframe, columns=['name'])
+    header_list = myfielddf.to_csv(header=None, index=False).strip('\n').split('\n')
     header = MY_SEP.join(header_list)
 
-    output = EOL_SEP.join(record_body_list)
-    header_output = EOL_SEP.join((header, output))
+    return header, header_list
 
-    return header_output
+def build_body(query_records, header_list):
+    """
+    This builds the body of the output from the results of query_records
+    """
+    record_body_list = list()
+    for record in query_records["records"]:
+        record_line_list = list()
+        for header in header_list:
+            recordlist = str(record["map"][header]).replace(',','|')
+            record_line_list.append(recordlist)
+            record_line = MY_SEP.join(record_line_list)
+        record_body_list.append(record_line)
+    output = EOL_SEP.join(record_body_list)
+
+    return output
 
 ### class ###
 class SumoApiClient():
@@ -380,24 +454,6 @@ class SumoApiClient():
         response = self.get('/v1/search/jobs/' + str(search_jobid))
         return json.loads(response.text)
 
-    def search_job_records_tally(self, query_jobid):
-        """
-        Find out search job records
-        """
-        query_output = self.search_job_status(query_jobid)
-        query_status = query_output['state']
-        num_records = query_output['recordCount']
-        time.sleep(1)
-        iterations = 1
-        while query_status == 'GATHERING RESULTS':
-            query_output = self.search_job_status(query_jobid)
-            query_status = query_output['state']
-            num_records = query_output['recordCount']
-            time.sleep(1)
-            iterations += 1
-
-        return (query_status, num_records, iterations)
-
     def calculate_and_fetch_records(self, query_jobid, num_records):
         """
         Calculate and return records in chunks based on LIMIT
@@ -412,22 +468,24 @@ class SumoApiClient():
 
         return job_records
 
-    def search_job_messages_tally(self, query_jobid):
+    def search_job_tally(self, query_jobid):
         """
         Find out search job messages
         """
         query_output = self.search_job_status(query_jobid)
         query_status = query_output['state']
         num_messages = query_output['messageCount']
-        time.sleep(1)
+        num_records = query_output['recordCount']
+        time.sleep(random.randint(0,MY_SLEEP))
         iterations = 1
         while query_status == 'GATHERING RESULTS':
             query_output = self.search_job_status(query_jobid)
             query_status = query_output['state']
             num_messages = query_output['messageCount']
-            time.sleep(1)
+            num_records = query_output['recordCount']
+            time.sleep(random.randint(0,MY_SLEEP))
             iterations += 1
-        return (query_status, num_messages, iterations)
+        return (query_status, num_messages, num_records, iterations)
 
     def calculate_and_fetch_messages(self, query_jobid, num_messages):
         """
@@ -436,6 +494,7 @@ class SumoApiClient():
         job_messages = []
         iterations = num_messages // LIMIT + 1
         for iteration in range(1, iterations + 1):
+            time.sleep(random.randint(0,MY_SLEEP))
             records = self.search_job_records(query_jobid, limit=LIMIT,
                                               offset=((iteration - 1) * LIMIT))
             for record in records['records']:
