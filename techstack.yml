@@ -2,7 +2,7 @@ repo_name: wayne-kirk-schmidt/sumologic-query
 report_id: 8a1b170ab8f41bd9a709d7cefa605b4f
 version: 0.1
 repo_type: Public
-timestamp: '2024-01-05T09:03:06+00:00'
+timestamp: '2024-02-29T18:26:11+00:00'
 requested_by: wks-sumo-logic
 provider: github
 branch: master
